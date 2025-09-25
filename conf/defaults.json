@@ -1,0 +1,18 @@
+{
+  "default_ports": {
+    "ssh": 22,
+    "http": 80,
+    "tls": 443,
+    "v2ray": 443,
+    "squid": [8080, 3128],
+    "openvpn": 1194
+  },
+  "http_injector_defaults": {
+    "payload": "GET / HTTP/1.1\\r\\nHost: example.com\\r\\nConnection: keep-alive\\r\\n\\r\\n",
+    "method": "GET",
+    "sni": "",
+    "alpn": "",
+    "proxy_type": "none",
+    "remote_port": 443
+  }
+}
