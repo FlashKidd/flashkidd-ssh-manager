@@ -10,7 +10,9 @@ ASSET_SOURCE_ROOT=""
 TEMP_ARCHIVE_DIR=""
 BIN_DIR=""
 CONFIG_DIR="/etc/fk-ssh"
+
 INSTALL_ROOT="/usr/local/lib/flashkidd-ssh-manager"
+
 
 # Determine an initial repository root if the script is executed from disk.
 # When the script is piped over stdin (e.g. curl | bash), BASH_SOURCE is not
@@ -304,6 +306,7 @@ create_symlinks() {
         return
     fi
 
+
     if [[ $DRY_RUN -eq 1 ]]; then
         printf '[dry-run] mkdir -p %s\n' "$SYMLINK_DIR"
     else
@@ -317,6 +320,18 @@ create_symlinks() {
         name="$(basename "$script_path")"
         dest="$SYMLINK_DIR/$name"
         link_src="$BIN_DIR/$name"
+
+
+    if [[ $DRY_RUN -ne 1 ]]; then
+        mkdir -p "$SYMLINK_DIR"
+    fi
+
+    local script name dest
+    for script in "$BIN_DIR"/fk-*; do
+        [[ -f "$script" ]] || continue
+
+        name="$(basename "$script")"
+        dest="$SYMLINK_DIR/$name"
 
         if [[ $DRY_RUN -eq 1 ]]; then
             printf '[dry-run] ln -sf %s %s\n' "$link_src" "$dest"
