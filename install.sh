@@ -294,54 +294,26 @@ write_channel() {
 }
 
 create_symlinks() {
-    print_step "Linking executables into $SYMLINK_DIR"
+  print_step "Linking executables into $SYMLINK_DIR"
+  if [[ ! -d "$BIN_DIR" ]]; then
+    print_warn "Repository bin directory not found ($BIN_DIR)."
+    return
+  fi
 
-    local source_bin_dir="$BIN_DIR"
-    if [[ $DRY_RUN -eq 1 && -n "$ASSET_SOURCE_ROOT" && ! -d "$source_bin_dir" ]]; then
-        source_bin_dir="$ASSET_SOURCE_ROOT/bin"
-    fi
-
-    if [[ ! -d "$source_bin_dir" ]]; then
-        print_warn "Repository bin directory not found ($source_bin_dir)."
-        return
-    fi
-
-
+  local script name dest
+  for script in "$BIN_DIR"/fk-*; do
+    [[ -f "$script" ]] || continue
+    name="$(basename "$script")"
+    dest="$SYMLINK_DIR/$name"
     if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] mkdir -p %s\n' "$SYMLINK_DIR"
-    else
-        mkdir -p "$SYMLINK_DIR"
+      printf '[dry-run] ln -sf %s %s\n' "$script" "$dest"
+      continue
     fi
-
-    local script_path name dest link_src
-    for script_path in "$source_bin_dir"/fk-*; do
-        [[ -f "$script_path" ]] || continue
-
-        name="$(basename "$script_path")"
-        dest="$SYMLINK_DIR/$name"
-        link_src="$BIN_DIR/$name"
-
-
-    if [[ $DRY_RUN -ne 1 ]]; then
-        mkdir -p "$SYMLINK_DIR"
-    fi
-
-    local script name dest
-    for script in "$BIN_DIR"/fk-*; do
-        [[ -f "$script" ]] || continue
-
-        name="$(basename "$script")"
-        dest="$SYMLINK_DIR/$name"
-
-        if [[ $DRY_RUN -eq 1 ]]; then
-            printf '[dry-run] ln -sf %s %s\n' "$link_src" "$dest"
-            continue
-        fi
-
-        ln -sf "$link_src" "$dest"
-        chmod +x "$link_src"
-    done
+    ln -sf "$script" "$dest"
+    chmod +x "$script"
+  done
 }
+
 
 prompt_ports_if_needed() {
     local ports_file="$CONFIG_DIR/ports.env"
