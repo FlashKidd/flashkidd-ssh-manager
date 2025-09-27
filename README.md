@@ -1,107 +1,172 @@
-# Flashkidd SSH Manager
+# FlashKidd SSH Manager
 
-Flashkidd SSH Manager provides an interactive `fk-ssh` orchestration CLI along with helper scripts that streamline creating SSH and V2Ray accounts, managing payload artifacts, editing banners, tuning proxy ports, and scraping CDN diagnostics. The toolkit is tailored for operators who need to generate the raw connection details that power HTTP Injector or mobile tunneling clients while keeping secrets safe on-disk.
+![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg) ![Shell](https://img.shields.io/badge/Shell-Bash%20POSIX-green.svg)
+
+FlashKidd SSH Manager is a production-ready automation toolkit that provisions secure SSH, VPN, and proxy services on any modern Debian/Ubuntu host. It wraps best-practice hardening, service management, payload generation, and reconnaissance tooling into a cohesive command line experience.
 
 ## Features
+- Interactive `fk-ssh` control center with 16 operational modules.
+- Idempotent installer that bootstraps dependencies, firewall rules, and configuration scaffolding.
+- Full SSH lifecycle management (create, trial, renew, delete) with compliance-grade logging.
+- Automated OpenVPN and WireGuard profile generators with PKI handling and QR support.
+- V2Ray VMess/VLESS/WebSocket manager with systemd integration and client link exports.
+- Per-user bandwidth throttling using `tc` + iptables marks, persisted through a systemd unit.
+- Safe port management with collision detection, firewall reconciliation, and rollback.
+- Reconnaissance suite (port scan, subdomain sweep, HTTP scraper, and fronting detector).
+- Backup/restore automation, banner customization, system dashboards, and log viewers.
+- FlashKidd fronting detector with JSON parsing, DNS/TLS/HTTP heuristics, and CSV exports.
 
-- Interactive menu-driven workflow for provisioning SSH or V2Ray (vmess/vless) accounts, managing ports, editing ANSI banners, generating payload fields, scraping CDN headers, and reviewing the last account summary.【F:bin/fk-ssh†L1-L139】
-- Non-interactive subcommands for automation-friendly user creation, payload generation, and JSON exports suitable for piping into external tooling.【F:bin/fk-ssh†L417-L508】【F:bin/fk-payload.sh†L1-L90】
-- Secure account registry stored in `/opt/flashkidd/conf/users/<username>.json` with atomic writes and `chmod 600`, plus an index file and audit logging that excludes secrets.【F:bin/fk-user.sh†L118-L206】
-- Payload helpers that emit raw field data (not full client configs) for SSH, OpenVPN, V2Ray, Shadowsocks, HTTP proxy, and SOCKS5 flows, with vmess JSON + single-line imports when requested.【F:bin/fk-payload.sh†L92-L205】
-- Squid port helpers that default to 8080/3128 and allow persistent reconfiguration via the Port Manager menu.【F:lib/squid.sh†L1-L57】【F:conf/defaults.json†L2-L14】
-- Reliable server IP detection that prioritises the system routing table and falls back to ifconfig.co to keep all generated outputs hostname-free.【F:lib/server_info.sh†L1-L33】
+## Quick Start
+1. `apt update -y`
+2. `curl -fsSL https://raw.githubusercontent.com/FlashKidd/flashkidd-ssh-manager/main/install.sh | sudo bash`
+3. Run: `fk-ssh`
 
-## Requirements
+The installer creates `/etc/fk-ssh/`, copies example configuration files, installs dependencies, and symlinks the `fk-*` toolchain into `/usr/local/bin/`.
 
-- Bash 5+
-- Python 3.8+
-- `curl`, `iproute2`, and standard GNU coreutils
-- Permission to create and write to:
-  - `/opt/flashkidd/conf/`
-  - `/opt/flashkidd/payloads/`
-  - `/var/log/flashkidd-ssh-manager.log`
+## Default Ports
+| Service | Variable | Default |
+|---------|----------|---------|
+| OpenSSH | `SSH_PORT_PRIMARY` | 22 |
+| OpenSSH (secondary) | `SSH_PORT_SECONDARY` | 80 |
+| SSH over TLS | `SSH_TLS_PORT` | 443 |
+| Squid/HTTP Proxy | `SQUID_PORTS` | 8080 3128 90 |
+| V2Ray VMess TCP | `V2RAY_VMESS_TCP` | 10086 |
+| V2Ray VMess WebSocket | `V2RAY_VMESS_WS` | 80 |
+| V2Ray VMess TLS-WS | `V2RAY_VMESS_TLS` | 443 |
+| V2Ray VLESS TLS | `V2RAY_VLESS_TLS` | 443 |
+| OpenVPN UDP | `OPENVPN_UDP` | 1194 |
+| OpenVPN TCP | `OPENVPN_TCP` | 443 |
+| WireGuard UDP | `WIREGUARD_UDP` | 51820 |
 
-> **Tip:** Run the CLI as a privileged user (e.g. via `sudo`) so it can persist configuration, payload, and audit files in the required locations.
+To change a value edit `/etc/fk-ssh/ports.env` or use the Port Manager module from `fk-ssh`. Every change validates port availability, updates firewall rules, and logs the operation.
 
-## Installation
+## Copy-Ready Examples
 
-1. Clone the repository on the target server:
-   ```bash
-   git clone https://github.com/flashkidd/flashkidd-ssh-manager.git
-   cd flashkidd-ssh-manager
-   ```
-2. (Optional) Place the executables on your `PATH`:
-   ```bash
-   sudo install -m 0755 bin/fk-ssh /usr/local/bin/
-   sudo install -m 0755 bin/fk-user.sh /usr/local/bin/
-   sudo install -m 0755 bin/fk-payload.sh /usr/local/bin/
-   ```
-3. Ensure the configuration and payload directories exist with the right ownership:
-   ```bash
-   sudo mkdir -p /opt/flashkidd/conf /opt/flashkidd/payloads
-   sudo chown $USER /opt/flashkidd/conf /opt/flashkidd/payloads
-   ```
-4. Verify defaults by inspecting `conf/defaults.json` and adjust only if necessary before first use.【F:conf/defaults.json†L1-L18】
-
-## Usage
-
-### Interactive mode
-
-Launch the main menu:
-```bash
-fk-ssh
+### Create SSH User
+```
++----------------- Account Created ------------------+
+ Server IP   : 203.0.113.15
+ Username    : alice
+ Password    : p@ssw0rd!
+ Expires     : 2024-12-31  (30 days)
+ SSH Port(s) : 22 80
+-----------------------------------------------------
+ Copy/paste ready SSH:
+ ssh alice@203.0.113.15 -p 22
++----------------------------------------------------+
 ```
 
-Choose from the numbered options to create accounts, manage ports, generate payload field snippets, edit the colorful banner saved in `conf/banner.txt`, run the CDN/link scraper, or view the last created account. Each account creation flow resolves the server IP, prints a human-friendly summary card, and writes a JSON record alongside any payload artifacts.【F:bin/fk-ssh†L140-L416】
-
-### Non-interactive account creation
-
-Automate provisioning without menus using subcommands:
-```bash
-fk-ssh user create \
-  --user flashkidd \
-  --services ssh,v2ray,squid \
-  --expires $(date -d '+7 days' --iso-8601=seconds) \
-  --port-map '{"ssh":22,"v2ray":443,"squid":[8080,3128]}' \
-  --json-output /tmp/flashkidd.json
+### Create Trial User
 ```
-The CLI emits a compact success line, writes the JSON payload to `/tmp/flashkidd.json`, and still stores the canonical record under `/opt/flashkidd/conf/users/<username>.json`. Use `--help` on any subcommand to discover additional flags.【F:bin/fk-ssh†L417-L508】
-
-### Generating payload field snippets
-
-Use the dedicated helper to craft field-only payload data:
-```bash
-fk-payload.sh --proto vmess --user flashkidd --json
++----------------- Trial Account Created ------------------+
+ Server IP   : 203.0.113.15
+ Username    : trial3kp9 (Trial)
+ Password    : 2nrb3qhq
+ Expires     : 2024-07-05  (3 days)
+ SSH Port(s) : 22 80
+-----------------------------------------------------
+ Copy/paste ready SSH:
+ ssh trial3kp9@203.0.113.15 -p 22
++----------------------------------------------------+
 ```
-- When `--proto vmess` is selected, the script writes a vmess JSON file to `/opt/flashkidd/payloads/`, prints a one-line `vmess://` string, and returns machine-readable metadata when `--json` is used.【F:bin/fk-payload.sh†L92-L205】
-- Other protocols (SSH, OpenVPN, Shadowsocks, HTTP proxy, SOCKS5) output structured fields describing the remote host, port, payload string, and credentials placeholders.【F:bin/fk-payload.sh†L92-L205】
 
-### Managing ports
-
-The Port Manager updates the persisted port state at `/opt/flashkidd/conf/ports.json` so subsequent sessions reuse your custom values. Squid helpers ensure safe writes and maintain the expected dual-port default of 8080 and 3128.【F:bin/fk-ssh†L24-L139】【F:lib/squid.sh†L1-L57】
-
-### CDN / Link Scraper
-
-From the menu, supply a target URL. The scraper fetches the page, extracts unique hosts, then issues HEAD requests capturing `Server`, `Via`, `X-Cache`, `CF-Ray`, and `X-Amz-Cf-Id` headers to help identify CDN-backed endpoints.【F:bin/fk-ssh†L309-L369】
-
-## Data & Logging Layout
-
-- **User records:** `/opt/flashkidd/conf/users/<username>.json` (0600) with metadata, vmess link (when applicable), and payload paths.【F:bin/fk-user.sh†L118-L206】
-- **User index:** `/opt/flashkidd/conf/users.json` keeps a list of known accounts for quick lookup.【F:bin/fk-user.sh†L161-L206】
-- **Payloads:** `/opt/flashkidd/payloads/` stores generated field files, including vmess JSON exports and optional OpenVPN stubs.【F:bin/fk-ssh†L202-L254】【F:bin/fk-payload.sh†L92-L205】
-- **Audit log:** `/var/log/flashkidd-ssh-manager.log` receives metadata-only entries without plaintext secrets or full vmess URIs.【F:bin/fk-user.sh†L71-L117】
-
-## Testing
-
-Run the regression script to validate IP detection, summary formatting, payload metadata, and squid defaults:
-```bash
-./tests/test_all.sh
+### V2Ray VMess Link
 ```
-The tests execute isolated helper routines and confirm key behaviors expected by the CLI.【F:tests/test_all.sh†L1-L75】
+VMess client created
+Name : premium-01
+UUID : 12345678-90ab-cdef-1234-567890abcdef
+Expires : 2024-12-31
+Link : vmess://eyJ2IjoiMiIsInBzIjoicHJlbWl1bS0wMSIsImFkZCI6ImNkbi5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjEyMzQ1Njc4LTkwYWItY2RlZi0xMjM0LTU2Nzg5MGFiY2RlZiIsIm5ldCI6IndzIiwidHlwZSI6Im5vbmUiLCJob3N0Ijoib3JpZ2luLmV4YW1wbGUuY29tIiwicGF0aCI6Ii9mbGFzaGtpZGQiLCJ0bHMiOiJ0bHMifQ==
+```
 
-## Troubleshooting
+### Port Change with Rollback Safety
+```
++------------------------------------------------+
+| Port updated                                    |
+| Key: SSH_PORT_PRIMARY                           |
+| New port(s): 2222                               |
+| Firewall refreshed                              |
++------------------------------------------------+
+```
 
-- **Server IP resolution fails:** Ensure `ip route` is available. The fallback uses `curl -s ifconfig.co`; confirm outbound internet access.【F:lib/server_info.sh†L5-L33】
-- **Permission denied writing payloads or logs:** Re-run the CLI with elevated privileges or adjust ownership of `/opt/flashkidd` and `/var/log/flashkidd-ssh-manager.log`.
-- **Missing vmess output:** Check that the payload directory exists and that `fk-payload.sh` can create JSON files with `chmod 600` permissions.【F:bin/fk-payload.sh†L92-L205】
+### Fronting Detector Sample Output
+```
+FlashKidd Fronting Detector
+Legal notice: perform only on targets you control or have permission to test.
+DNS Resolution
+ SNI  : cdn.example.com -> 203.0.113.10
+ Host : origin.example.com -> 203.0.113.10
+TLS Certificate
+ CN     : origin.example.com
+ SAN    : origin.example.com
+ Issuer : FlashKidd CA
+ Valid  : Jan  1 00:00:00 2024 GMT -> Jan  1 00:00:00 2025 GMT
+HTTP fingerprints
+ Control bytes : 5120
+ Alternate     : 5120
+ CDN headers    : cf-ray:12345
+Heuristics
+ Verdict : WARN
+ Reasons : alt_host_served san_mismatch cdn_detected
+ Headers : cf-ray:12345
+ Saved headers -> /etc/fk-ssh/logs/fronting-20240101-120000-203.0.113.10.headers
+```
 
+## FlashKidd Fronting Detector
+The detector (`fk-detect-fronting.sh`) analyses potential CDN/SNI fronting scenarios:
+
+1. Parses optional JSON (V2Ray/XRay) to auto-populate IP, SNI, and WebSocket host/path.
+2. Resolves DNS for the SNI and HTTP host, highlighting mismatches.
+3. Extracts TLS metadata with `openssl s_client` (CN, SAN, issuer, validity window).
+4. Performs dual HTTP requests using `curl --resolve` to compare host headers.
+5. Flags CDN fingerprints (`cf-ray`, `x-cache`, `via`, `akamai`, `fastly`, `x-sucuri-id`).
+6. Generates colored verdicts (OK/WARN/FAIL), reason codes, and optional CSV rows.
+7. Saves raw headers to `/etc/fk-ssh/logs/fronting-<timestamp>-<ip>.headers`.
+
+**CLI shortcuts**
+```
+fk-detect-fronting.sh --json /etc/v2ray/config.json --ip 203.0.113.10 \
+  --sni cdn.example.com --host origin.example.com --path /flashkidd \
+  --out /root/fronting.csv
+```
+
+The detector honours `FK_COLOR`, `--color`, and `--no-color` flags and rate-limits scans to three per minute (overrideable by editing `/tmp/fk-fronting-history`). Exit code `2` signals a confirmed fronting vulnerability.
+
+## Settings & Pinning
+All configuration is stored under `/etc/fk-ssh/`:
+
+- `ports.env` – service port definitions read by every module.
+- `settings.env` – runtime flags, binary pinning (`FK_PIN_*`), update channels.
+- `throttle.rules` – bandwidth shaping rules applied at boot (`fk-throttle.service`).
+- `logs/` – consolidated log output, recon transcripts, detector headers.
+- `backups/` – archive location for `fk-backup.sh` outputs.
+
+Use the Settings/Security module (option 16) to toggle remote-fetch guard, manage pinning, and display firewall summaries.
+
+## Firewall Management
+FlashKidd detects `ufw`, `nftables`, or `iptables` and maintains a dedicated rule set for declared service ports. The Port Manager rewrites `/etc/fk-ssh/ports.env`, revalidates availability, applies rules, and prints a summary.
+
+## Backup & Restore
+- `fk-backup.sh` creates archives (`/etc/fk-ssh/backups/fk-ssh-<timestamp>.tar.gz`) including ports, settings, V2Ray/OpenVPN/WireGuard state, and banners.
+- `fk-restore.sh` restores from an archive, reloads systemd units, and restarts SSH/V2Ray/OpenVPN/WireGuard with safeguards.
+
+## Uninstall
+```
+systemctl disable --now fk-throttle.service fk-v2ray.service
+rm -f /usr/local/bin/fk-*
+rm -rf /etc/fk-ssh /etc/v2ray /etc/openvpn /etc/wireguard
+# Optionally remove generated PKI, backups, and logs
+```
+
+## Security Notes
+- Change default ports via the Port Manager and restrict access using the built-in firewall reconciliation.
+- Set `FK_DISABLE_REMOTE_FETCH=1` to block remote downloads in scripted environments.
+- Pin third-party binaries (`FK_PIN_V2RAY_VERSION`, `FK_PIN_V2RAY_SHA256`) before enabling service updates.
+- Disable password authentication once SSH keys are deployed (`/etc/ssh/sshd_config`).
+- Verify checksums of any downloaded artifacts using the Settings module (`Verify binary checksums`).
+
+## Appendix – Legal Warning
+The FlashKidd Fronting Detector performs active network requests that may be interpreted as probing. Only use it on systems and domains you own or where you have explicit authorization. The authors and maintainers assume no liability for misuse.
+
+## License
+Licensed under the [GNU General Public License v3.0 or later](LICENSE).
