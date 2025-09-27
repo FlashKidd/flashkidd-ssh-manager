@@ -10,7 +10,15 @@ TEMP_ARCHIVE_DIR=""
 BIN_DIR=""
 CONFIG_DIR="/etc/fk-ssh"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Determine an initial repository root if the script is executed from disk.
+# When the script is piped over stdin (e.g. curl | bash), BASH_SOURCE is not
+# set which would normally trigger an unbound variable error under `set -u`.
+# Using the ':-' guard keeps the script compatible with both invocation styles.
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+else
+    REPO_ROOT=""
+fi
 CONFIG_DIR="/etc/fk-ssh"
 BIN_DIR="$REPO_ROOT/bin"
 
@@ -251,15 +259,16 @@ create_symlinks() {
         print_warn "Repository bin directory not found ($BIN_DIR)."
         return
     fi
-    local script
+    if [[ $DRY_RUN -ne 1 ]]; then
+        mkdir -p "$SYMLINK_DIR"
+    fi
+
+    local script name dest
     for script in "$BIN_DIR"/fk-*; do
         [[ -f "$script" ]] || continue
 
-    for script in "$BIN_DIR"/fk-*; do
-
-        local name
         name="$(basename "$script")"
-        local dest="$SYMLINK_DIR/$name"
+        dest="$SYMLINK_DIR/$name"
         if [[ $DRY_RUN -eq 1 ]]; then
             printf '[dry-run] ln -sf %s %s\n' "$script" "$dest"
             continue
