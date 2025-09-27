@@ -1,0 +1,8 @@
+# FlashKidd SSH Manager
+*.tar.gz
+*.log
+*.tmp
+*.bak
+.DS_Store
+__pycache__/
+node_modules/

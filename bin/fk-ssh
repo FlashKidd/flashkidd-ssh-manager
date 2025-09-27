@@ -1,630 +1,144 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-DEFAULTS_FILE="$ROOT_DIR/conf/defaults.json"
-PORT_STATE_FILE="/opt/flashkidd/conf/ports.json"
-BANNER_FILE="$ROOT_DIR/conf/banner.txt"
-source "$ROOT_DIR/lib/server_info.sh"
-source "$ROOT_DIR/lib/squid.sh"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# shellcheck disable=SC1090
+source "$SCRIPT_DIR/fk-settings.sh"
 
-declare -A CURRENT_PORTS
-declare -a CURRENT_SQUID_PORTS
+fk_common_init "$@"
+set -- "${FK_ARGS[@]}"
 
-read_default_ports() {
-  python3 - "$DEFAULTS_FILE" <<'PY'
-import json, sys
-with open(sys.argv[1]) as fh:
-    data = json.load(fh)
-for key, value in data["default_ports"].items():
-    if isinstance(value, list):
-        print(f"{key}={'/'.join(str(v) for v in value)}")
-    else:
-        print(f"{key}={value}")
-PY
-}
+fk_require_root
+fk_load_env
 
-load_ports() {
-  local key value
-  while IFS== read -r key value; do
-    case $key in
-      squid)
-        IFS='/' read -r -a CURRENT_SQUID_PORTS <<<"$value"
-        ;;
-      *)
-        CURRENT_PORTS[$key]=$value
-        ;;
-    esac
-  done < <(read_default_ports)
-  if [[ -f $PORT_STATE_FILE ]]; then
-    while IFS== read -r key value; do
-      if [[ $key == "squid" ]]; then
-        IFS=',' read -r -a CURRENT_SQUID_PORTS <<<"$value"
-      else
-        CURRENT_PORTS[$key]=$value
-      fi
-    done < <(python3 - "$PORT_STATE_FILE" <<'PY'
-import json, sys
-with open(sys.argv[1]) as fh:
-    data = json.load(fh)
-for key, value in data.items():
-    if isinstance(value, list):
-        print(f"{key}={','.join(str(v) for v in value)}")
-    else:
-        print(f"{key}={value}")
-PY
-)
-  fi
-}
+CHILD_COLOR_ARGS=()
+if [[ ${FK_COLOR_OFF:-0} -eq 1 ]]; then
+    CHILD_COLOR_ARGS+=(--no-color)
+elif [[ ${FK_COLOR_FORCED:-0} -eq 1 || ${FK_COLOR:-0} -eq 1 ]]; then
+    CHILD_COLOR_ARGS+=(--color)
+fi
+JUST_PRINTED_BANNER=0
 
-save_port_state() {
-  local squid_csv
-  squid_csv=$(IFS=','; echo "${CURRENT_SQUID_PORTS[*]}")
-  PORT_SSH="${CURRENT_PORTS[ssh]}" \
-  PORT_HTTP="${CURRENT_PORTS[http]}" \
-  PORT_TLS="${CURRENT_PORTS[tls]}" \
-  PORT_V2RAY="${CURRENT_PORTS[v2ray]}" \
-  PORT_OPENVPN="${CURRENT_PORTS[openvpn]}" \
-  SQUID_CSV="$squid_csv" \
-  python3 - "$PORT_STATE_FILE" <<'PY'
-import json, os, sys
-path = sys.argv[1]
-ports = {
-    "ssh": int(os.environ["PORT_SSH"]),
-    "http": int(os.environ["PORT_HTTP"]),
-    "tls": int(os.environ["PORT_TLS"]),
-    "v2ray": int(os.environ["PORT_V2RAY"]),
-    "openvpn": int(os.environ["PORT_OPENVPN"]),
-    "squid": [int(p) for p in os.environ.get("SQUID_CSV", "").split(',') if p]
-}
-dirname = os.path.dirname(path)
-os.makedirs(dirname, exist_ok=True)
-tmp = os.path.join(dirname, f'.tmp.{os.getpid()}')
-with open(tmp, 'w') as fh:
-    json.dump(ports, fh, indent=2)
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-PY
-}
-
-build_ports_json() {
-  local v2ray_override=${1:-${CURRENT_PORTS[v2ray]}}
-  local squid_csv
-  squid_csv=$(IFS=','; echo "${CURRENT_SQUID_PORTS[*]}")
-  PORT_SSH="${CURRENT_PORTS[ssh]}" \
-  PORT_HTTP="${CURRENT_PORTS[http]}" \
-  PORT_TLS="${CURRENT_PORTS[tls]}" \
-  PORT_V2RAY="$v2ray_override" \
-  PORT_OPENVPN="${CURRENT_PORTS[openvpn]}" \
-  SQUID_CSV="$squid_csv" \
-  python3 - <<'PY'
-import json, os
-squid = [int(p) for p in os.environ.get("SQUID_CSV", "").split(',') if p]
-print(json.dumps({
-    "ssh": int(os.environ["PORT_SSH"]),
-    "http": int(os.environ["PORT_HTTP"]),
-    "tls": int(os.environ["PORT_TLS"]),
-    "v2ray": int(os.environ["PORT_V2RAY"]),
-    "squid": squid,
-    "openvpn": int(os.environ["PORT_OPENVPN"])
-}))
-PY
-}
-
-json_array() {
-  python3 - "$@" <<'PY'
-import json, sys
-print(json.dumps(sys.argv[1:]))
-PY
-}
-
-json_list() {
-  python3 - "$@" <<'PY'
-import json, sys
-print(json.dumps(sys.argv[1:]))
-PY
-}
-
-format_ports_summary() {
-  local squid_ports
-  squid_ports=$(IFS=,; echo "${CURRENT_SQUID_PORTS[*]}")
-  printf 'ssh=%s, http=%s, tls=%s, v2ray=%s, squid=%s' \
-    "${CURRENT_PORTS[ssh]}" "${CURRENT_PORTS[http]}" "${CURRENT_PORTS[tls]}" "${CURRENT_PORTS[v2ray]}" "$squid_ports"
-}
-
-ensure_dirs() {
-  mkdir -p /opt/flashkidd/payloads
-  mkdir -p /opt/flashkidd/conf
-}
-
-generate_password() {
-  python3 - <<'PY'
-import random, string
-alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-rng = random.SystemRandom()
-print(''.join(rng.choice(alphabet) for _ in range(16)))
-PY
-}
-
-calc_expiry() {
-  local days=$1
-  if [[ -z $days ]]; then
-    echo ""
-  else
-    date -d "+${days} days" --iso-8601=seconds
-  fi
-}
-
-build_human_summary() {
-  local username=$1
-  local auth_method=$2
-  local password=$3
-  local services=$4
-  local created_at=$5
-  local expires_at=$6
-  local payloads_json=$7
-  local ovpn_url=$8
-  local vmess_link=$9
-  local color_green="$(tput setaf 2 2>/dev/null || true)"
-  local color_reset="$(tput sgr0 2>/dev/null || true)"
-  local port_summary
-  port_summary=$(format_ports_summary)
-  printf '%s\n' '--------------------------------------------------------'
-  printf '%s✅ Account created successfully%s\n' "$color_green" "$color_reset"
-  printf 'Username : %s\n' "$username"
-  printf 'Auth     : %s\n' "$auth_method"
-  printf 'Password : %s\n' "$password"
-  printf 'Services : %s\n' "$services"
-  printf 'ServerIP : %s\n' "$SERVER_IP"
-  printf 'Ports    : %s\n' "$port_summary"
-  printf 'Created  : %s\n' "$created_at"
-  printf 'Expires  : %s\n' "${expires_at:-n/a}"
-  printf 'OVPN     : %s\n' "${ovpn_url:-n/a}"
-  if [[ -n $vmess_link ]]; then
-    printf 'VMess    : %s\n' "$vmess_link"
-  fi
-  printf 'Payloads :\n'
-  python3 - "$payloads_json" <<'PY'
-import json, sys
-paths = json.loads(sys.argv[1])
-for path in paths:
-    print(f"  - {path}")
-PY
-  printf '%s\n' '--------------------------------------------------------'
-}
-
-show_success_card() {
-  local username=$1
-  local payloads_json=$2
-  while true; do
-    echo "[1] Show payload files"
-    echo "[2] Copy commands"
-    echo "[3] Revoke user"
-    echo "[4] Back"
-    read -rp "Choose an action: " action
-    case $action in
-      1)
-        python3 - "$payloads_json" <<'PY'
-import json, sys
-paths = json.loads(sys.argv[1])
-for path in paths:
-    print(f"--- {path} ---")
-    try:
-        with open(path) as fh:
-            print(fh.read())
-    except FileNotFoundError:
-        print("(missing)")
-PY
-        ;;
-      2)
-        echo "SSH command: ssh ${username}@${SERVER_IP} -p ${CURRENT_PORTS[ssh]}"
-        echo "VMess/VLess links were shown above if generated."
-        ;;
-      3)
-        "$ROOT_DIR/bin/fk-user.sh" revoke --username "$username"
-        echo "User revoked."
-        ;;
-      4)
-        break
-        ;;
-      *)
-        echo "Invalid option"
-        ;;
-    esac
-  done
-}
-
-create_ssh_account() {
-  local username password days generate_ovpn
-  read -rp "Username [flashkidd]: " username
-  username=${username:-flashkidd}
-  read -srp "Password (blank for random): " password
-  echo
-  if [[ -z $password ]]; then
-    password=$(generate_password)
-  fi
-  read -rp "Valid for how many days? [30]: " days
-  days=${days:-30}
-  read -rp "Generate OVPN stub? (y/N): " generate_ovpn
-  local created_at
-  created_at=$(date --iso-8601=seconds)
-  local expires_at
-  expires_at=$(calc_expiry "$days")
-  ensure_dirs
-  local payload_paths=()
-  mapfile -t ssh_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto ssh --user "$username" --port "${CURRENT_PORTS[ssh]}" --json)
-  local ssh_meta="${ssh_lines[-1]}"
-  unset 'ssh_lines[-1]'
-  local ssh_file="/opt/flashkidd/payloads/${username}-ssh-${SERVER_IP}-${CURRENT_PORTS[ssh]}.txt"
-  printf '%s\n' "${ssh_lines[@]}" >"$ssh_file"
-  chmod 600 "$ssh_file"
-  payload_paths+=("$ssh_file")
-  local ovpn_url=""
-  if [[ ${generate_ovpn,,} == y ]]; then
-    local ovpn_file="/opt/flashkidd/payloads/${username}-openvpn-${SERVER_IP}.ovpn"
-    cat <<OVPN >"$ovpn_file"
-client
-proto udp
-remote ${SERVER_IP} ${CURRENT_PORTS[openvpn]}
-resolv-retry infinite
-nobind
-persist-key
-persist-tun
-redirect-gateway def1 bypass-dhcp
-cipher AES-256-CBC
-verb 3
-OVPN
-    chmod 600 "$ovpn_file"
-    payload_paths+=("$ovpn_file")
-    ovpn_url="http://${SERVER_IP}/payloads/$(basename "$ovpn_file")"
-  fi
-  local services=(ssh squid)
-  if [[ -n $ovpn_url ]]; then
-    services+=(openvpn)
-  fi
-  local services_json
-  services_json=$(json_array "${services[@]}")
-  local payloads_json
-  payloads_json=$(json_list "${payload_paths[@]}")
-  local ports_json
-  ports_json=$(build_ports_json)
-  local user_json
-  user_json=$("$ROOT_DIR/bin/fk-user.sh" create \
-    --username "$username" \
-    --auth-method password \
-    --password "$password" \
-    --services "$services_json" \
-    --ports "$ports_json" \
-    --server-ip "$SERVER_IP" \
-    --payloads "$payloads_json" \
-    --created-at "$created_at" \
-    --expires-at "${expires_at:-}" \
-    --vmess-link "" \
-    --vmess-json-path "")
-  local services_csv
-  services_csv=$(IFS=','; echo "${services[*]}")
-  local summary
-  summary=$(build_human_summary "$username" password "$password" "$services_csv" "$created_at" "$expires_at" "$payloads_json" "$ovpn_url" "")
-  printf '%s\n' "$summary"
-  printf '%s\n' "$user_json"
-  LAST_HUMAN_SUMMARY=$(mktemp)
-  LAST_JSON_SUMMARY=$(mktemp)
-  printf '%s\n' "$summary" >"$LAST_HUMAN_SUMMARY"
-  printf '%s\n' "$user_json" >"$LAST_JSON_SUMMARY"
-  show_success_card "$username" "$payloads_json"
-}
-
-create_v2ray_account() {
-  local username protocol port_choice password
-  read -rp "Username [flashkidd]: " username
-  username=${username:-flashkidd}
-  read -rp "Protocol (vmess/vless) [vmess]: " protocol
-  protocol=${protocol:-vmess}
-  read -rp "Port [${CURRENT_PORTS[v2ray]}]: " port_choice
-  port_choice=${port_choice:-${CURRENT_PORTS[v2ray]}}
-  read -srp "Password (blank for random metadata): " password
-  echo
-  if [[ -z $password ]]; then
-    password=$(generate_password)
-  fi
-  local created_at
-  created_at=$(date --iso-8601=seconds)
-  ensure_dirs
-  local payload_paths=()
-  local vmess_link=""
-  local vmess_json_path=""
-  if [[ $protocol == vmess ]]; then
-    mapfile -t vmess_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto vmess --user "$username" --port "$port_choice" --json)
-    vmess_link="${vmess_lines[0]}"
-    local vmess_meta="${vmess_lines[-1]}"
-    vmess_json_path=$(python3 - "$vmess_meta" <<'PY'
-import json, sys
-print(json.loads(sys.argv[1])["payload_path"])
-PY
-)
-    payload_paths+=("$vmess_json_path")
-  else
-    mapfile -t vless_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto vless --user "$username" --port "$port_choice" --json)
-    vmess_link="${vless_lines[0]}"
-  fi
-  local payloads_json
-  payloads_json=$(json_list "${payload_paths[@]}")
-  local services=(v2ray)
-  local services_json
-  services_json=$(json_array "${services[@]}")
-  local ports_json
-  ports_json=$(build_ports_json "$port_choice")
-  local user_json
-  user_json=$("$ROOT_DIR/bin/fk-user.sh" create \
-    --username "$username" \
-    --auth-method password \
-    --password "$password" \
-    --services "$services_json" \
-    --ports "$ports_json" \
-    --server-ip "$SERVER_IP" \
-    --payloads "$payloads_json" \
-    --created-at "$created_at" \
-    --expires-at "" \
-    --vmess-link "$vmess_link" \
-    --vmess-json-path "$vmess_json_path")
-  local services_csv
-  services_csv=$(IFS=','; echo "${services[*]}")
-  local summary
-  summary=$(build_human_summary "$username" password "$password" "$services_csv" "$created_at" "" "$payloads_json" "" "$vmess_link")
-  printf '%s\n' "$summary"
-  printf '%s\n' "$user_json"
-  LAST_HUMAN_SUMMARY=$(mktemp)
-  LAST_JSON_SUMMARY=$(mktemp)
-  printf '%s\n' "$summary" >"$LAST_HUMAN_SUMMARY"
-  printf '%s\n' "$user_json" >"$LAST_JSON_SUMMARY"
-  show_success_card "$username" "$payloads_json"
-}
-
-port_manager() {
-  while true; do
-    echo "Current ports:"
-    echo "SSH     : ${CURRENT_PORTS[ssh]}"
-    echo "HTTP    : ${CURRENT_PORTS[http]}"
-    echo "TLS     : ${CURRENT_PORTS[tls]}"
-    echo "V2Ray   : ${CURRENT_PORTS[v2ray]}"
-    echo "OpenVPN : ${CURRENT_PORTS[openvpn]}"
-    echo "Squid   : ${CURRENT_SQUID_PORTS[*]}"
-    read -rp "Update service (ssh/http/tls/v2ray/openvpn/squid) or b to back: " svc
-    case $svc in
-      b|B) break ;;
-      ssh|http|tls|v2ray|openvpn)
-        read -rp "New port: " new_port
-        if [[ $new_port =~ ^[0-9]+$ ]]; then
-          CURRENT_PORTS[$svc]=$new_port
-          save_port_state
-        else
-          echo "Invalid port"
-        fi
-        ;;
-      squid)
-        read -rp "Enter comma-separated ports [8080,3128]: " squid_input
-        squid_input=${squid_input:-8080,3128}
-        IFS=',' read -r -a CURRENT_SQUID_PORTS <<<"$squid_input"
-        save_port_state
-        update_squid_ports "${CURRENT_SQUID_PORTS[@]}"
-        ;;
-      *)
-        echo "Unknown service"
-        ;;
-    esac
-  done
-}
-
-banner_editor() {
-  echo "Enter banner text (end with a single '.' on a line):"
-  local lines=()
-  while IFS= read -r line; do
-    [[ $line == '.' ]] && break
-    lines+=("$line")
-  done
-  printf '%s\n' "${lines[@]}" >"$BANNER_FILE"
-  echo "Preview:"
-  printf '\e[1;34m%s\e[0m\n' "${lines[*]}"
-}
-
-payload_generator_menu() {
-  read -rp "Protocol (ssh/vmess/vless/shadowsocks/openvpn/http-proxy/socks5): " proto
-  proto=${proto:-ssh}
-  "$ROOT_DIR/bin/fk-payload.sh" --proto "$proto" --user flashkidd
-}
-
-cdn_scraper() {
-  read -rp "Target URL: " target
-  if [[ -z $target ]]; then
-    echo "URL required"
-    return
-  fi
-  local content
-  content=$(curl -sL "$target" || true)
-  if [[ -z $content ]]; then
-    echo "No content retrieved"
-    return
-  fi
-  mapfile -t urls < <(python3 - <<'PY'
-import sys, re
-html = sys.stdin.read()
-links = set(re.findall(r"https?://[A-Za-z0-9\.-]+(?:/[A-Za-z0-9_\./-]*)?", html))
-for link in sorted(links):
-    print(link)
-PY
- <<<"$content")
-  for url in "${urls[@]}"; do
-    headers=$(curl -sI -L --max-time 10 "$url" || true)
-    server=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="server" {print $2; exit}')
-    via=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="via" {print $2; exit}')
-    xcache=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="x-cache" {print $2; exit}')
-    cfray=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="cf-ray" {print $2; exit}')
-    amaz=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="x-amz-cf-id" {print $2; exit}')
-    echo "$url -> Server:${server:-n/a} Via:${via:-n/a} X-Cache:${xcache:-n/a} CF-Ray:${cfray:-n/a} X-Amz-Cf-Id:${amaz:-n/a}"
-  done
-}
-
-view_last_account() {
-  if [[ -n ${LAST_HUMAN_SUMMARY:-} && -f $LAST_HUMAN_SUMMARY ]]; then
-    cat "$LAST_HUMAN_SUMMARY"
-  else
-    echo "No account created yet."
-  fi
-  if [[ -n ${LAST_JSON_SUMMARY:-} && -f $LAST_JSON_SUMMARY ]]; then
-    cat "$LAST_JSON_SUMMARY"
-  fi
-}
-
-non_interactive_create() {
-  local username="flashkidd"
-  local password=""
-  local services_csv="ssh"
-  local expires=""
-  local port_map_json=""
-  local json_output=""
-  local auth_method="password"
-  local v2ray_proto="vmess"
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      --user) username=$2; shift 2;;
-      --password) password=$2; shift 2;;
-      --services) services_csv=$2; shift 2;;
-      --expires) expires=$2; shift 2;;
-      --port-map) port_map_json=$2; shift 2;;
-      --json-output) json_output=$2; shift 2;;
-      --auth) auth_method=$2; shift 2;;
-      --v2ray-proto) v2ray_proto=$2; shift 2;;
-      *) echo "Unknown option $1" >&2; exit 1;;
-    esac
-  done
-  if [[ -z $password ]]; then
-    password=$(generate_password)
-  fi
-  ensure_dirs
-  local services=()
-  IFS=',' read -r -a services <<<"$services_csv"
-  local payload_paths=()
-  local vmess_link=""
-  local vmess_json_path=""
-  for svc in "${services[@]}"; do
-    case $svc in
-      ssh)
-        mapfile -t ssh_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto ssh --user "$username" --port "${CURRENT_PORTS[ssh]}" --json)
-        unset 'ssh_lines[-1]'
-        local ssh_file="/opt/flashkidd/payloads/${username}-ssh-${SERVER_IP}-${CURRENT_PORTS[ssh]}.txt"
-        printf '%s\n' "${ssh_lines[@]}" >"$ssh_file"
-        chmod 600 "$ssh_file"
-        payload_paths+=("$ssh_file")
-        ;;
-      v2ray)
-        if [[ $v2ray_proto == vmess ]]; then
-          mapfile -t vmess_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto vmess --user "$username" --port "${CURRENT_PORTS[v2ray]}" --json)
-          vmess_link="${vmess_lines[0]}"
-          local vmess_meta="${vmess_lines[-1]}"
-          vmess_json_path=$(python3 - "$vmess_meta" <<'PY'
-import json, sys
-print(json.loads(sys.argv[1])["payload_path"])
-PY
-)
-          payload_paths+=("$vmess_json_path")
-        else
-          mapfile -t vless_lines < <("$ROOT_DIR/bin/fk-payload.sh" --proto vless --user "$username" --port "${CURRENT_PORTS[v2ray]}" --json)
-          vmess_link="${vless_lines[0]}"
-        fi
-        ;;
-      *) ;;
-    esac
-  done
-  local services_json
-  services_json=$(json_array "${services[@]}")
-  local payloads_json
-  payloads_json=$(json_list "${payload_paths[@]}")
-  local ports_json
-  if [[ -n $port_map_json ]]; then
-    ports_json=$port_map_json
-  else
-    ports_json=$(build_ports_json)
-  fi
-  local created_at
-  created_at=$(date --iso-8601=seconds)
-  local user_json
-  user_json=$("$ROOT_DIR/bin/fk-user.sh" create \
-    --username "$username" \
-    --auth-method "$auth_method" \
-    --password "$password" \
-    --services "$services_json" \
-    --ports "$ports_json" \
-    --server-ip "$SERVER_IP" \
-    --payloads "$payloads_json" \
-    --created-at "$created_at" \
-    --expires-at "$expires" \
-    --vmess-link "$vmess_link" \
-    --vmess-json-path "$vmess_json_path" \
-    ${json_output:+--json-output "$json_output"})
-  local services_csv_spaces
-  services_csv_spaces=$(IFS=','; echo "${services[*]}")
-  local summary
-  summary=$(build_human_summary "$username" "$auth_method" "$password" "$services_csv_spaces" "$created_at" "$expires" "$payloads_json" "" "$vmess_link")
-  printf '%s\n' "$summary"
-  printf '%s\n' "$user_json"
-}
-
-main_menu() {
-  while true; do
-    cat <<MENU
-1) Create SSH account
-2) Create V2Ray account
-3) Port Manager
-4) Banner Editor
-5) Payload Generator
-6) CDN / Link Scraper
-7) View last created account
-8) Exit
+show_menu() {
+    local skip="${1:-0}"
+    if [[ "$skip" -eq 0 ]]; then
+        fk_banner
+    fi
+    cat <<'MENU'
+1) Create SSH user
+2) Create Trial user
+3) Renew / Extend SSH user
+4) Delete SSH user
+5) Show online users
+6) V2Ray (vmess/vless/ws)
+7) OpenVPN / WireGuard
+8) Per-user throttle
+9) Port Manager (safe rollback)
+10) Payload generator
+11) Recon suite
+12) Backup / Restore
+13) Custom banner / MOTD
+14) System dashboard
+15) Logs & sessions
+16) Settings / Security
+0) Exit
 MENU
-    read -rp "Select option: " choice
-    case $choice in
-      1) create_ssh_account ;;
-      2) create_v2ray_account ;;
-      3) port_manager ;;
-      4) banner_editor ;;
-      5) payload_generator_menu ;;
-      6) cdn_scraper ;;
-      7) view_last_account ;;
-      8) exit 0 ;;
-      *) echo "Invalid option" ;;
-    esac
-  done
 }
 
-SERVER_IP=$(get_server_ip)
-if [[ -z $SERVER_IP ]]; then
-  echo "Unable to determine server IP" >&2
-  exit 1
-fi
-
-load_ports
-
-if [[ $# -gt 0 ]]; then
-  case $1 in
-    user)
-      shift
-      case ${1:-} in
-        create)
-          shift
-          non_interactive_create "$@"
-          ;;
+while true; do
+    show_menu "$JUST_PRINTED_BANNER"
+    JUST_PRINTED_BANNER=0
+    read -rp 'Select option: ' choice
+    case "$choice" in
+        1)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-user-add.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        2)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-user-trial.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        3)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-user-renew.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        4)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-user-del.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        5)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-users-online.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        6)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-v2ray-menu.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        7)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-vpn-menu.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        8)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-throttle.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        9)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-port-manager.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        10)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-payloads.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        11)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-recon.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        12)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-backup.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        13)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-banner.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        14)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-dashboard.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        15)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-logs.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        16)
+            FK_POST_ACTION_BANNER=0
+            "$SCRIPT_DIR/fk-settings.sh" "${CHILD_COLOR_ARGS[@]}"
+            JUST_PRINTED_BANNER=${FK_POST_ACTION_BANNER:-0}
+            ;;
+        0)
+            printf 'Goodbye!\n'
+            exit 0
+            ;;
         *)
-          echo "Unknown user subcommand" >&2
-          exit 1
-          ;;
-      esac
-      ;;
-    *)
-      echo "Unknown command" >&2
-      exit 1
-      ;;
-  esac
-else
-  main_menu
-fi
+            printf 'Invalid option.\n'
+            sleep 1
+            JUST_PRINTED_BANNER=0
+            ;;
+    esac
+done
