@@ -6,11 +6,21 @@ set -euo pipefail
 
 
 REPO_ROOT=""
+ASSET_SOURCE_ROOT=""
 TEMP_ARCHIVE_DIR=""
 BIN_DIR=""
 CONFIG_DIR="/etc/fk-ssh"
+INSTALL_ROOT="/usr/local/lib/flashkidd-ssh-manager"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Determine an initial repository root if the script is executed from disk.
+# When the script is piped over stdin (e.g. curl | bash), BASH_SOURCE is not
+# set which would normally trigger an unbound variable error under `set -u`.
+# Using the ':-' guard keeps the script compatible with both invocation styles.
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+else
+    REPO_ROOT=""
+fi
 CONFIG_DIR="/etc/fk-ssh"
 BIN_DIR="$REPO_ROOT/bin"
 
@@ -163,9 +173,39 @@ resolve_repo_root() {
     fi
     if [[ -d "$candidate/bin" && -f "$candidate/install.sh" ]]; then
         REPO_ROOT="$candidate"
+        ASSET_SOURCE_ROOT="$REPO_ROOT"
         return
     fi
     download_repo_archive
+    ASSET_SOURCE_ROOT="$REPO_ROOT"
+}
+
+stage_repo_assets() {
+    if [[ "$REPO_ROOT" == "$INSTALL_ROOT" ]]; then
+        return
+    fi
+
+    local source_root="$REPO_ROOT"
+
+    if [[ -z "$ASSET_SOURCE_ROOT" ]]; then
+        ASSET_SOURCE_ROOT="$source_root"
+    fi
+
+    print_step "Staging repository into $INSTALL_ROOT"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[dry-run] rm -rf %s\n' "$INSTALL_ROOT"
+        printf '[dry-run] mkdir -p %s\n' "$INSTALL_ROOT"
+        printf '[dry-run] cp -a %s/. %s/\n' "$source_root" "$INSTALL_ROOT"
+        REPO_ROOT="$INSTALL_ROOT"
+        return
+    fi
+
+    rm -rf "$INSTALL_ROOT"
+    mkdir -p "$INSTALL_ROOT"
+    cp -a "$source_root/." "$INSTALL_ROOT/"
+    REPO_ROOT="$INSTALL_ROOT"
+    ASSET_SOURCE_ROOT="$INSTALL_ROOT"
 }
 
 
@@ -200,8 +240,14 @@ create_dirs() {
 
 copy_examples() {
     local files=("ports.env" "settings.env")
+    local repo_root_for_read="$REPO_ROOT"
+
+    if [[ $DRY_RUN -eq 1 && -n "$ASSET_SOURCE_ROOT" && ! -d "$REPO_ROOT/etc/fk-ssh" ]]; then
+        repo_root_for_read="$ASSET_SOURCE_ROOT"
+    fi
+
     for file in "${files[@]}"; do
-        local example="$REPO_ROOT/etc/fk-ssh/${file}.example"
+        local example="$repo_root_for_read/etc/fk-ssh/${file}.example"
         local dest="$CONFIG_DIR/$file"
         if [[ ! -f "$example" ]]; then
             print_warn "Missing example file: $example"
@@ -219,14 +265,15 @@ copy_examples() {
         fi
     done
     # Templates
-    if [[ -f "$REPO_ROOT/etc/fk-ssh/templates/detect-docs.md.example" ]]; then
+    local template_source="$repo_root_for_read/etc/fk-ssh/templates/detect-docs.md.example"
+    if [[ -f "$template_source" ]]; then
         local tmpl_dest="$CONFIG_DIR/templates"
         if [[ $DRY_RUN -eq 1 ]]; then
             printf '[dry-run] mkdir -p %s\n' "$tmpl_dest"
-            printf '[dry-run] cp %s %s/\n' "$REPO_ROOT/etc/fk-ssh/templates/detect-docs.md.example" "$tmpl_dest"
+            printf '[dry-run] cp %s %s/\n' "$template_source" "$tmpl_dest"
         else
             mkdir -p "$tmpl_dest"
-            cp "$REPO_ROOT/etc/fk-ssh/templates/detect-docs.md.example" "$tmpl_dest/"
+            cp "$template_source" "$tmpl_dest/"
         fi
     fi
 }
@@ -247,25 +294,37 @@ write_channel() {
 create_symlinks() {
     print_step "Linking executables into $SYMLINK_DIR"
 
-    if [[ ! -d "$BIN_DIR" ]]; then
-        print_warn "Repository bin directory not found ($BIN_DIR)."
+    local source_bin_dir="$BIN_DIR"
+    if [[ $DRY_RUN -eq 1 && -n "$ASSET_SOURCE_ROOT" && ! -d "$source_bin_dir" ]]; then
+        source_bin_dir="$ASSET_SOURCE_ROOT/bin"
+    fi
+
+    if [[ ! -d "$source_bin_dir" ]]; then
+        print_warn "Repository bin directory not found ($source_bin_dir)."
         return
     fi
-    local script
-    for script in "$BIN_DIR"/fk-*; do
-        [[ -f "$script" ]] || continue
 
-    for script in "$BIN_DIR"/fk-*; do
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[dry-run] mkdir -p %s\n' "$SYMLINK_DIR"
+    else
+        mkdir -p "$SYMLINK_DIR"
+    fi
 
-        local name
-        name="$(basename "$script")"
-        local dest="$SYMLINK_DIR/$name"
+    local script_path name dest link_src
+    for script_path in "$source_bin_dir"/fk-*; do
+        [[ -f "$script_path" ]] || continue
+
+        name="$(basename "$script_path")"
+        dest="$SYMLINK_DIR/$name"
+        link_src="$BIN_DIR/$name"
+
         if [[ $DRY_RUN -eq 1 ]]; then
-            printf '[dry-run] ln -sf %s %s\n' "$script" "$dest"
+            printf '[dry-run] ln -sf %s %s\n' "$link_src" "$dest"
             continue
         fi
-        ln -sf "$script" "$dest"
-        chmod +x "$script"
+
+        ln -sf "$link_src" "$dest"
+        chmod +x "$link_src"
     done
 }
 
@@ -326,6 +385,7 @@ main() {
     ensure_root
 
     resolve_repo_root
+    stage_repo_assets
     BIN_DIR="$REPO_ROOT/bin"
 
     print_step "Installing FlashKidd SSH Manager"
