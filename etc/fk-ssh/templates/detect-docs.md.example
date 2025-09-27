@@ -1,0 +1,51 @@
+# FlashKidd Fronting Detector Template
+
+```json
+{
+  "inbounds": [
+    {
+      "protocol": "vmess",
+      "port": 443,
+      "streamSettings": {
+        "network": "ws",
+        "tlsSettings": {
+          "serverName": "cdn.example.com"
+        },
+        "wsSettings": {
+          "headers": {
+            "Host": "origin.example.com"
+          },
+          "path": "/flashkidd"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "vnext": [
+          {
+            "address": "203.0.113.10",
+            "port": 443
+          }
+        ]
+      }
+    }
+  ],
+  "dns": {
+    "hosts": {
+      "cdn.example.com": "203.0.113.10"
+    }
+  }
+}
+```
+
+- **SNI Host**: `cdn.example.com`
+- **HTTP Host Override**: `origin.example.com`
+- **Path**: `/flashkidd`
+
+Use:
+```
+fk-detect-fronting.sh --json config.json --ip 203.0.113.10 --sni cdn.example.com --host origin.example.com --path /flashkidd
+```
