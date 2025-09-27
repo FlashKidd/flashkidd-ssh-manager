@@ -1,312 +1,275 @@
+# path: install.sh
 #!/usr/bin/env bash
+# FlashKidd SSH Manager — Installer
+# Safe, idempotent, and works when piped via curl | bash or run from a cloned repo.
+
 set -euo pipefail
 
-# FlashKidd SSH Manager installer
-# This script is idempotent and safe to re-run.
-
-
-REPO_ROOT=""
-ASSET_SOURCE_ROOT=""
-TEMP_ARCHIVE_DIR=""
-BIN_DIR=""
-CONFIG_DIR="/etc/fk-ssh"
-
-INSTALL_ROOT="/usr/local/lib/flashkidd-ssh-manager"
-
-
-# Determine an initial repository root if the script is executed from disk.
-# When the script is piped over stdin (e.g. curl | bash), BASH_SOURCE is not
-# set which would normally trigger an unbound variable error under `set -u`.
-# Using the ':-' guard keeps the script compatible with both invocation styles.
-if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# ------------------------- Safe script path handling -------------------------
+# When run via stdin (curl | bash), BASH_SOURCE[0] may be unset with `set -u`.
+: "${BASH_SOURCE[0]:=${0:-}}"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+if [[ -n "${SCRIPT_SOURCE}" && "${SCRIPT_SOURCE}" != "-" && -f "${SCRIPT_SOURCE}" ]]; then
+  REPO_ROOT="$(cd "$(dirname "${SCRIPT_SOURCE}")" >/dev/null 2>&1 && pwd -P)"
 else
-    REPO_ROOT=""
+  # stdin mode: start in current directory, may download archive later
+  REPO_ROOT="$(pwd -P)"
 fi
-CONFIG_DIR="/etc/fk-ssh"
-BIN_DIR="$REPO_ROOT/bin"
 
+# ------------------------------- Defaults -----------------------------------
+CONFIG_DIR="/etc/fk-ssh"
+LOG_DIR="${CONFIG_DIR}/logs"
+BACKUP_DIR="${CONFIG_DIR}/backups"
 SYMLINK_DIR="/usr/local/bin"
-LOG_DIR="$CONFIG_DIR/logs"
-BACKUP_DIR="$CONFIG_DIR/backups"
-PORTS_WERE_PRESENT=0
 
 DRY_RUN=0
 AUTO_MODE=0
 CHANNEL="stable"
 
-ARCHIVE_REF="GIT_COMMIT_PLACEHOLDER"
-ARCHIVE_SHA256=""
+# When run outside a repo, we fetch the repo tarball. These can be overridden
+# by env if you later pin to a specific commit + checksum.
+ARCHIVE_REF="${FK_INSTALL_REF:-main}"
+ARCHIVE_SHA256="${FK_INSTALL_SHA256:-}"  # optional; if set, will be verified
 
-# Allow overrides for testing or air-gapped deployments
-ARCHIVE_REF="${FK_INSTALL_REF:-$ARCHIVE_REF}"
-ARCHIVE_SHA256="${FK_INSTALL_SHA256:-$ARCHIVE_SHA256}"
-
-# When the script is executed directly from the repository the placeholder above
-# is replaced via release automation. If it is still present we fall back to the
-# main branch without a checksum (callers can set FK_INSTALL_REF/FK_INSTALL_SHA256
-# for stricter verification).
-if [[ "$ARCHIVE_REF" == "GIT_COMMIT_PLACEHOLDER" ]]; then
-    ARCHIVE_REF="main"
-    ARCHIVE_SHA256=""
-fi
-
-
-print_step() {
-    printf '==> %s\n' "$1"
-}
-
-print_warn() {
-    printf 'Warning: %s\n' "$1" >&2
-}
+# ------------------------------- Helpers ------------------------------------
+print_step(){ printf '==> %s\n' "$1"; }
+print_warn(){ printf 'WARN: %s\n' "$1" >&2; }
+die(){ printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 
 usage() {
-    cat <<USAGE
-FlashKidd SSH Manager installer
-Usage: $0 [--dry-run] [--auto] [--channel <name>]
+  cat <<'USAGE'
+FlashKidd SSH Manager — installer
+
+Usage: install.sh [--auto] [--dry-run] [--channel <name>] [--help]
 
 Options:
-  --dry-run         Show actions without changing the system
-  --auto            Skip confirmations; accept defaults when possible
-  --channel <name>  Persisted in settings.env as FK_CHANNEL=<name>
-  --help            Display this help message
+  --auto           Non-interactive; accept defaults (still prompts for ports if missing)
+  --dry-run        Show actions without changing the system
+  --channel NAME   Persist FK_CHANNEL=NAME in /etc/fk-ssh/settings.env (default: stable)
+  --help           Show this help
 USAGE
 }
 
 parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run)
-                DRY_RUN=1
-                shift
-                ;;
-            --auto)
-                AUTO_MODE=1
-                shift
-                ;;
-            --channel)
-                CHANNEL="${2:-}"
-                if [[ -z "$CHANNEL" ]]; then
-                    printf 'Error: --channel requires a value\n' >&2
-                    exit 2
-                fi
-                shift 2
-                ;;
-            --help|-h)
-                usage
-                exit 0
-                ;;
-            *)
-                printf 'Unknown option: %s\n' "$1" >&2
-                usage
-                exit 2
-                ;;
-        esac
-    done
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --auto)    AUTO_MODE=1; shift;;
+      --dry-run) DRY_RUN=1; shift;;
+      --channel) CHANNEL="${2:-}"; [[ -n "$CHANNEL" ]] || die "--channel requires a value"; shift 2;;
+      --help|-h) usage; exit 0;;
+      *) usage; die "Unknown option: $1";;
+    esac
+  done
 }
 
-run_or_print() {
-    if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] %s\n' "$*"
-    else
-        eval "$@"
-    fi
+run_or_echo() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '[dry-run] %s\n' "$*"
+  else
+    eval "$@"
+  fi
 }
 
 ensure_root() {
-    if [[ $EUID -ne 0 ]]; then
-        printf 'This installer must be run as root.\n' >&2
-        exit 1
-    fi
+  if [[ $EUID -ne 0 ]]; then
+    die "This installer must be run as root (use sudo)."
+  fi
 }
 
-
-cleanup_temp_dir() {
-    if [[ -n "$TEMP_ARCHIVE_DIR" && -d "$TEMP_ARCHIVE_DIR" ]]; then
-        rm -rf "$TEMP_ARCHIVE_DIR"
-    fi
-}
-
+# --------------------------- Repo acquisition -------------------------------
+TEMP_ARCHIVE_DIR=""
+cleanup_temp(){ [[ -n "$TEMP_ARCHIVE_DIR" ]] && [[ -d "$TEMP_ARCHIVE_DIR" ]] && rm -rf "$TEMP_ARCHIVE_DIR"; }
 download_repo_archive() {
-    TEMP_ARCHIVE_DIR="$(mktemp -d)"
-    trap cleanup_temp_dir EXIT
-    local archive="$TEMP_ARCHIVE_DIR/repo.tar.gz"
-    local url="https://github.com/FlashKidd/flashkidd-ssh-manager/archive/${ARCHIVE_REF}.tar.gz"
-    print_step "Fetching repository assets (${ARCHIVE_REF})"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] curl -fsSL %s -o %s\n' "$url" "$archive"
-        if [[ -n "$ARCHIVE_SHA256" ]]; then
-            printf '[dry-run] echo "%s  %s" | sha256sum -c -\n' "$ARCHIVE_SHA256" "$archive"
-        fi
-        printf '[dry-run] tar -xzf %s -C %s\n' "$archive" "$TEMP_ARCHIVE_DIR"
-        REPO_ROOT="$TEMP_ARCHIVE_DIR/flashkidd-ssh-manager-${ARCHIVE_REF}"
-        return
-    fi
-    if ! curl -fsSL "$url" -o "$archive"; then
-        printf 'Failed to download repository archive from %s\n' "$url" >&2
-        exit 1
-    fi
-    if [[ -n "$ARCHIVE_SHA256" ]]; then
-        if ! echo "$ARCHIVE_SHA256  $archive" | sha256sum -c - >/dev/null 2>&1; then
-            printf 'Checksum verification failed for archive (%s).\n' "$ARCHIVE_SHA256" >&2
-            exit 1
-        fi
-    fi
-    if ! tar -xzf "$archive" -C "$TEMP_ARCHIVE_DIR"; then
-        printf 'Failed to unpack repository archive.\n' >&2
-        exit 1
-    fi
-    local extracted
-    extracted="$(find "$TEMP_ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d -name 'flashkidd-ssh-manager*' | head -n1)"
-    if [[ -z "$extracted" ]]; then
-        printf 'Unable to locate extracted repository directory.\n' >&2
-        exit 1
-    fi
-    REPO_ROOT="$extracted"
+  TEMP_ARCHIVE_DIR="$(mktemp -d)"
+  trap cleanup_temp EXIT
+
+  local url="https://github.com/FlashKidd/flashkidd-ssh-manager/archive/${ARCHIVE_REF}.tar.gz"
+  local archive="${TEMP_ARCHIVE_DIR}/repo.tar.gz"
+
+  print_step "Fetching repository (${ARCHIVE_REF})"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '[dry-run] curl -fsSL %q -o %q\n' "$url" "$archive"
+    [[ -n "$ARCHIVE_SHA256" ]] && printf '[dry-run] echo "%s  %s" | sha256sum -c -\n' "$ARCHIVE_SHA256" "$archive"
+    printf '[dry-run] tar -xzf %q -C %q\n' "$archive" "$TEMP_ARCHIVE_DIR"
+    REPO_ROOT="${TEMP_ARCHIVE_DIR}/flashkidd-ssh-manager-${ARCHIVE_REF}"
+    return
+  fi
+
+  curl -fsSL "$url" -o "$archive" || die "Download failed: $url"
+
+  if [[ -n "$ARCHIVE_SHA256" ]]; then
+    echo "${ARCHIVE_SHA256}  ${archive}" | sha256sum -c - >/dev/null 2>&1 || die "Archive checksum verification failed"
+  fi
+
+  tar -xzf "$archive" -C "$TEMP_ARCHIVE_DIR" || die "Failed to extract archive"
+  local extracted
+  extracted="$(find "$TEMP_ARCHIVE_DIR" -maxdepth 1 -mindepth 1 -type d -name 'flashkidd-ssh-manager*' | head -n1)"
+  [[ -n "$extracted" ]] || die "Extracted repo directory not found"
+  REPO_ROOT="$extracted"
 }
 
-resolve_repo_root() {
-    local source_path="${BASH_SOURCE[0]:-}"
-    local candidate=""
-    if [[ -n "$source_path" && -f "$source_path" ]]; then
-        candidate="$(cd "$(dirname "$source_path")" && pwd -P)"
-    else
-        candidate="$(pwd -P)"
-    fi
-    if [[ -d "$candidate/bin" && -f "$candidate/install.sh" ]]; then
-        REPO_ROOT="$candidate"
-        ASSET_SOURCE_ROOT="$REPO_ROOT"
-        return
-    fi
-    download_repo_archive
-    ASSET_SOURCE_ROOT="$REPO_ROOT"
+ensure_repo_root() {
+  # If bin/ exists here, assume we are in the repo; otherwise fetch.
+  if [[ -d "${REPO_ROOT}/bin" ]]; then
+    return
+  fi
+  download_repo_archive
 }
 
-stage_repo_assets() {
-    if [[ "$REPO_ROOT" == "$INSTALL_ROOT" ]]; then
-        return
-    fi
-
-    local source_root="$REPO_ROOT"
-
-    if [[ -z "$ASSET_SOURCE_ROOT" ]]; then
-        ASSET_SOURCE_ROOT="$source_root"
-    fi
-
-    print_step "Staging repository into $INSTALL_ROOT"
-
-    if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] rm -rf %s\n' "$INSTALL_ROOT"
-        printf '[dry-run] mkdir -p %s\n' "$INSTALL_ROOT"
-        printf '[dry-run] cp -a %s/. %s/\n' "$source_root" "$INSTALL_ROOT"
-        REPO_ROOT="$INSTALL_ROOT"
-        return
-    fi
-
-    rm -rf "$INSTALL_ROOT"
-    mkdir -p "$INSTALL_ROOT"
-    cp -a "$source_root/." "$INSTALL_ROOT/"
-    REPO_ROOT="$INSTALL_ROOT"
-    ASSET_SOURCE_ROOT="$INSTALL_ROOT"
-}
-
-
+# ----------------------------- System changes -------------------------------
 install_packages() {
-    local pkgs=("openssh-server" "curl" "jq" "coreutils" "iproute2" "nftables" "iptables" "ufw" "openvpn" "wireguard-tools" "nginx" "openssl" "tar" "xz-utils" "dnsutils" "netcat-openbsd")
-    print_step "Installing dependencies via apt"
+  local pkgs=(
+    openssh-server curl jq coreutils iproute2 nftables iptables ufw
+    openvpn wireguard-tools nginx openssl tar xz-utils dnsutils netcat-openbsd
+    qrencode
+  )
+  print_step "Installing dependencies (apt)"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[dry-run] apt-get update -y"
+    echo "[dry-run] DEBIAN_FRONTEND=noninteractive apt-get install -y ${pkgs[*]}"
+    return
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+  else
+    print_warn "apt-get not found; please install dependencies manually."
+  fi
+}
+
+create_dirs_and_init() {
+  print_step "Preparing directories under ${CONFIG_DIR}"
+  local d
+  for d in "$CONFIG_DIR" "$LOG_DIR" "$BACKUP_DIR" "${CONFIG_DIR}/templates"; do
     if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] apt-get update\n'
-        printf '[dry-run] apt-get install -y %s\n' "${pkgs[*]}"
-        return
-    fi
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+      printf '[dry-run] mkdir -p %s\n' "$d"
     else
-        print_warn "apt-get not found. Please install dependencies manually."
+      mkdir -p "$d"
     fi
-}
+  done
 
-create_dirs() {
-    for dir in "$CONFIG_DIR" "$LOG_DIR" "$BACKUP_DIR"; do
-        if [[ $DRY_RUN -eq 1 ]]; then
-            printf '[dry-run] mkdir -p %s\n' "$dir"
-        else
-            mkdir -p "$dir"
-        fi
-    done
-    if [[ -f "$CONFIG_DIR/ports.env" ]]; then
-        PORTS_WERE_PRESENT=1
+  # Copy *.example to live (if missing)
+  local ex dest
+  for ex in "ports.env" "settings.env"; do
+    local src="${REPO_ROOT}/etc/fk-ssh/${ex}.example"
+    dest="${CONFIG_DIR}/${ex}"
+    if [[ -f "$dest" ]]; then
+      continue
     fi
-}
-
-copy_examples() {
-    local files=("ports.env" "settings.env")
-    local repo_root_for_read="$REPO_ROOT"
-
-    if [[ $DRY_RUN -eq 1 && -n "$ASSET_SOURCE_ROOT" && ! -d "$REPO_ROOT/etc/fk-ssh" ]]; then
-        repo_root_for_read="$ASSET_SOURCE_ROOT"
+    if [[ -f "$src" ]]; then
+      print_step "Initializing ${dest}"
+      if [[ $DRY_RUN -eq 1 ]]; then
+        printf '[dry-run] cp %s %s && chmod 600 %s\n' "$src" "$dest" "$dest"
+      else
+        cp "$src" "$dest"
+        chmod 600 "$dest"
+      fi
+    else
+      print_warn "Missing example file in repo: $src"
     fi
+  done
 
-    for file in "${files[@]}"; do
-        local example="$repo_root_for_read/etc/fk-ssh/${file}.example"
-        local dest="$CONFIG_DIR/$file"
-        if [[ ! -f "$example" ]]; then
-            print_warn "Missing example file: $example"
-            continue
-        fi
-        if [[ -f "$dest" ]]; then
-            continue
-        fi
-        print_step "Initializing $dest from example"
-        if [[ $DRY_RUN -eq 1 ]]; then
-            printf '[dry-run] cp %s %s\n' "$example" "$dest"
-        else
-            cp "$example" "$dest"
-            chmod 600 "$dest"
-        fi
-    done
-    # Templates
-    local template_source="$repo_root_for_read/etc/fk-ssh/templates/detect-docs.md.example"
-    if [[ -f "$template_source" ]]; then
-        local tmpl_dest="$CONFIG_DIR/templates"
-        if [[ $DRY_RUN -eq 1 ]]; then
-            printf '[dry-run] mkdir -p %s\n' "$tmpl_dest"
-            printf '[dry-run] cp %s %s/\n' "$template_source" "$tmpl_dest"
-        else
-            mkdir -p "$tmpl_dest"
-            cp "$template_source" "$tmpl_dest/"
-        fi
+  # Template docs example
+  local tsrc="${REPO_ROOT}/etc/fk-ssh/templates/detect-docs.md.example"
+  if [[ -f "$tsrc" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf '[dry-run] cp %s %s/\n' "$tsrc" "${CONFIG_DIR}/templates"
+    else
+      cp "$tsrc" "${CONFIG_DIR}/templates/"
     fi
+  fi
 }
 
 write_channel() {
-    local dest="$CONFIG_DIR/settings.env"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] update %s with FK_CHANNEL=%s\n' "$dest" "$CHANNEL"
-        return
-    fi
-    if grep -q '^FK_CHANNEL=' "$dest" 2>/dev/null; then
-        sed -i "s/^FK_CHANNEL=.*/FK_CHANNEL=$CHANNEL/" "$dest"
+  local dest="${CONFIG_DIR}/settings.env"
+  print_step "Setting FK_CHANNEL=${CHANNEL}"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '[dry-run] ensure FK_CHANNEL in %s\n' "$dest"
+    return
+  fi
+  touch "$dest"
+  if grep -q '^FK_CHANNEL=' "$dest" 2>/dev/null; then
+    sed -i "s/^FK_CHANNEL=.*/FK_CHANNEL=${CHANNEL}/" "$dest"
+  else
+    printf '\nFK_CHANNEL=%s\n' "$CHANNEL" >> "$dest"
+  fi
+  chmod 600 "$dest"
+}
+
+port_in_use() {
+  local port="$1"
+  ss -lntup 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$port"
+}
+
+prompt_ports_if_needed() {
+  local ports_file="${CONFIG_DIR}/ports.env"
+  if [[ -s "$ports_file" ]]; then
+    return
+  fi
+
+  print_step "Configuring service ports (press Enter to accept defaults)"
+
+  declare -A defaults=(
+    [SSH_PORT_PRIMARY]=22
+    [SSH_PORT_SECONDARY]=80
+    [SSH_TLS_PORT]=443
+    [SQUID_PORTS]='8080 3128 90'
+    [V2RAY_VMESS_TCP]=10086
+    [V2RAY_VMESS_WS]=80
+    [V2RAY_VMESS_TLS]=443
+    [V2RAY_VLESS_TLS]=443
+    [OPENVPN_UDP]=1194
+    [OPENVPN_TCP]=443
+    [WIREGUARD_UDP]=51820
+    [WEBSOCKET_SSH_PORTS]='80 443'
+  )
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    for k in "${!defaults[@]}"; do
+      printf '[dry-run] would set %s="%s"\n' "$k" "${defaults[$k]}"
+    done
+    return
+  fi
+
+  : > "$ports_file"
+  for k in "${!defaults[@]}"; do
+    local def="${defaults[$k]}" val
+    if [[ $AUTO_MODE -eq 1 ]]; then
+      val="$def"
     else
-        printf '\nFK_CHANNEL=%s\n' "$CHANNEL" >> "$dest"
+      read -rp "$k [$def]: " val || true
+      val="${val:-$def}"
     fi
+
+    # Validate numeric single ports (not space lists)
+    if [[ "$val" =~ ^[0-9]+$ ]]; then
+      if port_in_use "$val"; then
+        print_warn "Port $val appears to be in use. Choose another."
+        read -rp "$k [choose another]: " val || true
+        [[ -z "$val" ]] && val="$def"
+      fi
+    fi
+
+    printf '%s="%s"\n' "$k" "$val" >> "$ports_file"
+  done
+  chmod 600 "$ports_file"
 }
 
 create_symlinks() {
-  print_step "Linking executables into $SYMLINK_DIR"
-  if [[ ! -d "$BIN_DIR" ]]; then
-    print_warn "Repository bin directory not found ($BIN_DIR)."
+  print_step "Linking executables to ${SYMLINK_DIR}"
+  local bin_dir="${REPO_ROOT}/bin"
+  if [[ ! -d "$bin_dir" ]]; then
+    print_warn "Repository bin/ not found at ${bin_dir}; skipping symlinks."
     return
   fi
 
   local script name dest
-  for script in "$BIN_DIR"/fk-*; do
+  for script in "${bin_dir}"/fk-*; do
     [[ -f "$script" ]] || continue
     name="$(basename "$script")"
-    dest="$SYMLINK_DIR/$name"
+    dest="${SYMLINK_DIR}/${name}"
     if [[ $DRY_RUN -eq 1 ]]; then
-      printf '[dry-run] ln -sf %s %s\n' "$script" "$dest"
+      printf '[dry-run] ln -sf %s %s && chmod +x %s\n' "$script" "$dest" "$script"
       continue
     fi
     ln -sf "$script" "$dest"
@@ -314,79 +277,23 @@ create_symlinks() {
   done
 }
 
-
-prompt_ports_if_needed() {
-    local ports_file="$CONFIG_DIR/ports.env"
-    if [[ $PORTS_WERE_PRESENT -eq 1 && -s "$ports_file" ]]; then
-        return
-    fi
-    cat <<'PORTS'
-FlashKidd SSH Manager requires confirmation of service ports.
-Provide ports (press Enter for defaults).
-PORTS
-    declare -A defaults=(
-        [SSH_PORT_PRIMARY]=22
-        [SSH_PORT_SECONDARY]=80
-        [SSH_TLS_PORT]=443
-        [SQUID_PORTS]='8080 3128 90'
-        [V2RAY_VMESS_TCP]=10086
-        [V2RAY_VMESS_WS]=80
-        [V2RAY_VMESS_TLS]=443
-        [V2RAY_VLESS_TLS]=443
-        [OPENVPN_UDP]=1194
-        [OPENVPN_TCP]=443
-        [WIREGUARD_UDP]=51820
-        [WEBSOCKET_SSH_PORTS]='80 443'
-    )
-    if [[ -f "$ports_file" ]]; then
-        # shellcheck disable=SC1090
-        source "$ports_file"
-    fi
-
-    if [[ $DRY_RUN -eq 1 ]]; then
-        local key default
-        for key in "${!defaults[@]}"; do
-            default="${!key:-${defaults[$key]}}"
-            printf '[dry-run] %s would be set to %s\n' "$key" "$default"
-        done
-        return
-    fi
-
-    : > "$ports_file"
-    local key value
-    for key in "${!defaults[@]}"; do
-        local default="${!key:-${defaults[$key]}}"
-        if [[ $AUTO_MODE -eq 1 ]]; then
-            value="$default"
-        else
-            read -rp "$key [$default]: " value
-            value="${value:-$default}"
-        fi
-        printf '%s="%s"\n' "$key" "$value" >> "$ports_file"
-    done
-    chmod 600 "$ports_file"
-}
-
+# ------------------------------- Main flow ----------------------------------
 main() {
-    parse_args "$@"
-    ensure_root
+  parse_args "$@"
+  ensure_root
 
-    resolve_repo_root
-    stage_repo_assets
-    BIN_DIR="$REPO_ROOT/bin"
+  # Make sure we have the repo contents
+  ensure_repo_root
 
-    print_step "Installing FlashKidd SSH Manager"
-    create_dirs
-    copy_examples
-    write_channel
-    prompt_ports_if_needed
-    install_packages
-    create_symlinks
-    print_step "Installation complete"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        print_warn "Dry-run mode enabled; no changes were made."
-    fi
-    printf 'Run: fk-ssh\n'
+  create_dirs_and_init
+  write_channel
+  prompt_ports_if_needed
+  install_packages
+  create_symlinks
+
+  print_step "Installation complete."
+  # REQUIRED exact final line:
+  echo 'Run: fk-ssh'
 }
 
 main "$@"
