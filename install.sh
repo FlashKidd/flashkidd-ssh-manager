@@ -4,10 +4,16 @@ set -euo pipefail
 # FlashKidd SSH Manager installer
 # This script is idempotent and safe to re-run.
 
+
 REPO_ROOT=""
 TEMP_ARCHIVE_DIR=""
 BIN_DIR=""
 CONFIG_DIR="/etc/fk-ssh"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="/etc/fk-ssh"
+BIN_DIR="$REPO_ROOT/bin"
+
 SYMLINK_DIR="/usr/local/bin"
 LOG_DIR="$CONFIG_DIR/logs"
 BACKUP_DIR="$CONFIG_DIR/backups"
@@ -16,6 +22,7 @@ PORTS_WERE_PRESENT=0
 DRY_RUN=0
 AUTO_MODE=0
 CHANNEL="stable"
+
 ARCHIVE_REF="GIT_COMMIT_PLACEHOLDER"
 ARCHIVE_SHA256=""
 
@@ -31,6 +38,7 @@ if [[ "$ARCHIVE_REF" == "GIT_COMMIT_PLACEHOLDER" ]]; then
     ARCHIVE_REF="main"
     ARCHIVE_SHA256=""
 fi
+
 
 print_step() {
     printf '==> %s\n' "$1"
@@ -100,6 +108,7 @@ ensure_root() {
     fi
 }
 
+
 cleanup_temp_dir() {
     if [[ -n "$TEMP_ARCHIVE_DIR" && -d "$TEMP_ARCHIVE_DIR" ]]; then
         rm -rf "$TEMP_ARCHIVE_DIR"
@@ -158,6 +167,7 @@ resolve_repo_root() {
     fi
     download_repo_archive
 }
+
 
 install_packages() {
     local pkgs=("openssh-server" "curl" "jq" "coreutils" "iproute2" "nftables" "iptables" "ufw" "openvpn" "wireguard-tools" "nginx" "openssl" "tar" "xz-utils" "dnsutils" "netcat-openbsd")
@@ -236,6 +246,7 @@ write_channel() {
 
 create_symlinks() {
     print_step "Linking executables into $SYMLINK_DIR"
+
     if [[ ! -d "$BIN_DIR" ]]; then
         print_warn "Repository bin directory not found ($BIN_DIR)."
         return
@@ -243,6 +254,9 @@ create_symlinks() {
     local script
     for script in "$BIN_DIR"/fk-*; do
         [[ -f "$script" ]] || continue
+
+    for script in "$BIN_DIR"/fk-*; do
+
         local name
         name="$(basename "$script")"
         local dest="$SYMLINK_DIR/$name"
@@ -282,6 +296,7 @@ PORTS
         # shellcheck disable=SC1090
         source "$ports_file"
     fi
+
     if [[ $DRY_RUN -eq 1 ]]; then
         local key default
         for key in "${!defaults[@]}"; do
@@ -290,6 +305,7 @@ PORTS
         done
         return
     fi
+
     : > "$ports_file"
     local key value
     for key in "${!defaults[@]}"; do
@@ -308,8 +324,10 @@ PORTS
 main() {
     parse_args "$@"
     ensure_root
+
     resolve_repo_root
     BIN_DIR="$REPO_ROOT/bin"
+
     print_step "Installing FlashKidd SSH Manager"
     create_dirs
     copy_examples
