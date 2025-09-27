@@ -1,0 +1,16 @@
+[Unit]
+Description=FlashKidd V2Ray Service (example)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Download and verify the pinned V2Ray/XRay binary before enabling this unit.
+# Example installation path (managed by fk-v2ray-menu.sh): /usr/local/bin/fk-v2ray-run
+ExecStart=/usr/local/bin/fk-v2ray-run
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/etc/v2ray
+
+[Install]
+WantedBy=multi-user.target
